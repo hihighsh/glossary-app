@@ -1,7 +1,12 @@
 import os
 import hmac
+import re
 import streamlit as st
+import pandas as pd
 
+# =========================
+# 0) Password Gate (Streamlit Cloud Secrets: APP_PASSWORD="...")
+# =========================
 def check_password():
     if "password_ok" not in st.session_state:
         st.session_state["password_ok"] = False
@@ -24,32 +29,23 @@ def check_password():
 if not check_password():
     st.stop()
 
-import re
-import streamlit as st
-import pandas as pd
 
-# ---------------------------------------------------
-# 1) 基本略号辞書（必要に応じて増やす）
-# ---------------------------------------------------
+# =========================
+# 1) Glossary dictionary
+# =========================
 DEFAULT_GLOSSARY = {
+    # cases / agreement
     "ACC": "accusative",
     "DAT": "dative",
     "GEN": "genitive",
     "ABL": "ablative",
     "LOC": "locative",
     "INS": "instrumental",
+    "POSS": "possessive",
     "PL": "plural",
     "SG": "singular",
-    "POSS": "possessive",
-    "IMP": "imperative",
-    "PROG": "progressive",
-    "Q": "question particle",
-    "VN": "verbal noun",
 
-    # person/number shorthand
-    "1": "1st person",
-    "2": "2nd person",
-    "3": "3rd person",
+    # person/number (as whole)
     "1SG": "1st person singular",
     "2SG": "2nd person singular",
     "3SG": "3rd person singular",
@@ -66,152 +62,187 @@ DEFAULT_GLOSSARY = {
     "3PL.POSS": "3rd person plural possessive",
 
     # verbal morphology
+    "VN": "verbal noun",
+    "IMP": "imperative",
+    "PROG": "progressive",
+    "Q": "question particle",
+
     "PTCP": "participle",
+    "PAST": "past",
+    "NPST": "non-past",
+
+    "CVB": "converb",
+    "SEQ": "sequential",
+    "CNT": "continuative",
+
+    # common combos
     "PTCP.PAST": "past participle",
     "PTCP.NPST": "non-past participle",
-    "CVB": "converb",
     "CVB.SEQ": "sequential converb",
     "CVB.CNT": "continuative converb",
 }
 
-# ---------------------------------------------------
-# 2) グロス行抽出（ノイズ除去）
-# ---------------------------------------------------
-def extract_gloss_lines(text, min_hyphen_tokens=2):
+# =========================
+# 2) Gloss line extraction (noise reduction)
+# =========================
+def extract_gloss_lines(text: str, min_hyphen_tokens: int = 2) -> list[str]:
     """
-    「グロス行っぽい行」だけを抽出する。
-    ルール：ハイフン付きトークンが一定数以上含まれる行をグロス行とみなす。
+    Extract only 'gloss-like' lines.
+    Heuristic: a line containing at least N tokens with '-' is considered a gloss line.
     """
     gloss_lines = []
     for line in text.splitlines():
-        line_strip = line.strip()
-        if not line_strip:
+        s = line.strip()
+        if not s:
             continue
-
-        # ハイフンを含むトークン数
-        tokens = re.split(r"\s+", line_strip)
+        tokens = re.split(r"\s+", s)
         hyphen_tokens = [t for t in tokens if "-" in t]
-
-        # 例: coachman-PL grain-ACC bazaar-DAT ...
         if len(hyphen_tokens) >= min_hyphen_tokens:
-            gloss_lines.append(line_strip)
-
+            gloss_lines.append(s)
     return gloss_lines
 
-
-# ---------------------------------------------------
-# 3) 略号抽出
-# ---------------------------------------------------
+# =========================
+# 3) Abbreviation extraction
+# =========================
+# Accept forms like: ACC, 3SG, 1PL, 2PL.POSS, PTCP.PAST, CVB.SEQ
 ABBR_PATTERN = re.compile(r"^(?:[0-9]*[A-Z]+(?:\.[A-Z0-9]+)*)$")
 
-def extract_abbreviations_from_gloss_lines(gloss_lines):
-    """
-    グロス行から略号を抽出する。
-    ・単語をハイフンやイコールで割り、後半側を候補にする
-    ・さらに '.' 区切りで複合略号も拾う
-    """
+def extract_abbreviations_from_gloss_lines(gloss_lines: list[str]) -> list[str]:
     abbreviations = []
-
     for line in gloss_lines:
-        # 記号で分割（空白、タブ）
         tokens = re.split(r"\s+", line)
-
         for token in tokens:
-            # まず "=" を分割
-            parts_eq = token.split("=")
-            for peq in parts_eq:
-                # "-" で分割（最初は語幹なので後ろ側を主に見る）
+            # split by '=' first
+            for peq in token.split("="):
+                # split by '-' (take suffix parts)
                 parts_hy = peq.split("-")
-
-                # 2PL.POSS-GEN みたいな場合
-                for ph in parts_hy[1:]:  # 後ろ側だけ
+                for ph in parts_hy[1:]:
                     ph = ph.strip(".,;:()[]{}\"'")
-
-                    # さらに "." で複合略号を拾う（PTCP.PASTなど）
-                    # "2PL.POSS" はそのまま1つとしても採る
                     if ABBR_PATTERN.match(ph):
                         abbreviations.append(ph)
-
-                    # もし "2PL.POSS" 内の要素も欲しければ分割して拾う:
-                    # 例: 2PL.POSS → 2PL, POSS も拾う
+                    # also pick components of dot-compounds
                     if "." in ph:
-                        subparts = ph.split(".")
-                        for sp in subparts:
+                        for sp in ph.split("."):
                             if ABBR_PATTERN.match(sp):
                                 abbreviations.append(sp)
-
     return abbreviations
 
+# =========================
+# 4) Hierarchical decomposition (PTCP.PAST -> PTCP + PAST)
+# =========================
+def decompose_abbr(abbr: str) -> list[str]:
+    """Split dot-compounds into components; keep original as well handled elsewhere."""
+    if "." in abbr:
+        return [p for p in abbr.split(".") if p]
+    return []
 
-def build_glossary_table(abbreviations, glossary_dict):
+def meaning_for_parts(parts: list[str], glossary: dict) -> str:
     """
-    略号リストから (Abbreviation, Meaning, Count) テーブルを作る
+    Build a human-readable meaning string from parts, e.g.
+    ['PTCP','PAST'] -> 'participle + past'
     """
-    freq = {}
+    if not parts:
+        return ""
+    meanings = []
+    for p in parts:
+        meanings.append(glossary.get(p, ""))  # may be empty
+    # show placeholders for unknown parts (optional; here we keep blank segments out)
+    nonempty = [m for m in meanings if m]
+    if not nonempty:
+        return ""
+    return " + ".join(nonempty)
+
+def build_glossary_table(abbreviations: list[str], glossary_dict: dict, enable_decomp: bool) -> pd.DataFrame:
+    # frequency
+    freq: dict[str, int] = {}
     for abbr in abbreviations:
         freq[abbr] = freq.get(abbr, 0) + 1
 
     rows = []
     for abbr, count in sorted(freq.items(), key=lambda x: (-x[1], x[0])):
         meaning = glossary_dict.get(abbr, "")
-        rows.append({"Abbreviation": abbr, "Meaning": meaning, "Count": count})
+        parts = decompose_abbr(abbr) if enable_decomp else []
+        parts_str = ".".join(parts) if parts else ""
+        parts_meaning = meaning_for_parts(parts, glossary_dict) if enable_decomp else ""
 
-    return pd.DataFrame(rows)
+        rows.append({
+            "Abbreviation": abbr,
+            "Meaning": meaning,
+            "Count": count,
+            "Parts": parts_str,                  # e.g., PTCP.PAST -> PTCP.PAST parts shown as "PTCP.PAST"? No: "PTCP.PAST" parts are "PTCP.PAST"? we store joined: "PTCP.PAST" minus original => "PTCP.PAST" becomes "PTCP.PAST"? Actually parts are ["PTCP","PAST"] -> "PTCP.PAST"
+            "Parts meaning": parts_meaning       # e.g., "participle + past"
+        })
+
+    df = pd.DataFrame(rows)
+
+    # If decomposition disabled, hide columns by returning only core columns
+    if not enable_decomp:
+        df = df[["Abbreviation", "Meaning", "Count"]]
+    else:
+        # keep a sensible column order
+        df = df[["Abbreviation", "Meaning", "Count", "Parts", "Parts meaning"]]
+
+    return df
 
 
-# ---------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------
+# =========================
+# 5) Streamlit UI
+# =========================
 st.set_page_config(page_title="Glossary Generator", layout="wide")
-st.title("📌 グロス略号辞書（Abbreviation Glossary）自動生成アプリ")
+st.title("📌 グロス略号辞書（Abbreviation Glossary）生成")
 
-st.markdown("""
-このアプリは以下を自動で行います：
-
-✅ **グロス行だけを抽出**（訳文・参考文献などのノイズを除外）  
-✅ **略号を抽出**（ACC, PL だけでなく **1PL, 3SG, 2PL.POSS, PTCP.PAST** なども拾う）  
-✅ **略号→意味を自動補完**（辞書にあるものはMeaningが自動入力）  
-✅ **表を編集してCSVで出力**
-""")
-
-example_text = """(1) aravakaš-lar ġala-ni bozor-ġa al-ïb bor-a
+# Session state for the input box (so Clear can wipe it)
+if "input_text" not in st.session_state:
+    st.session_state["input_text"] = """(1) aravakaš-lar ġala-ni bozor-ġa al-ïb bor-a
 coachman-PL grain-ACC bazaar-DAT take-CVB.SEQ go-CVB.CNT
 yat-ïb=dur.
 lie-PROG=3SG
 「御者は穀物をバザールに持って行っているところだ。」
 """
 
-text_input = st.text_area("📥 ここにテキストを貼り付けてください", value=example_text, height=260)
+top_left, top_right = st.columns([1, 1])
+with top_left:
+    if st.button("🧹 Clear（入力を消去）"):
+        st.session_state["input_text"] = ""
+        st.rerun()
+
+with top_right:
+    show_gloss_lines = st.checkbox("抽出されたグロス行を表示（事故防止のためデフォルトOFF）", value=False)
+
+text_input = st.text_area(
+    "📥 ここにテキストを貼り付けてください",
+    key="input_text",
+    height=260
+)
 
 col1, col2, col3 = st.columns([1, 1, 2])
-
 with col1:
     min_hyphen_tokens = st.number_input("グロス行判定：ハイフン語数", min_value=1, max_value=10, value=2)
-
 with col2:
-    run_button = st.button("🔍 Glossary生成")
+    enable_decomp = st.checkbox("略号を階層分解（PTCP.PAST → PTCP + PAST）", value=True)
+with col3:
+    run_button = st.button("🔍 Glossary生成", use_container_width=True)
 
 if run_button:
-    gloss_lines = extract_gloss_lines(text_input, min_hyphen_tokens=min_hyphen_tokens)
-
-    st.subheader("✅ 抽出されたグロス行")
-    if gloss_lines:
-        st.code("\n".join(gloss_lines))
-    else:
+    gloss_lines = extract_gloss_lines(text_input, min_hyphen_tokens=int(min_hyphen_tokens))
+    if not gloss_lines:
         st.warning("グロス行が見つかりませんでした。ハイフン語数の閾値を下げると改善する場合があります。")
         st.stop()
+
+    if show_gloss_lines:
+        st.subheader("✅ 抽出されたグロス行")
+        st.code("\n".join(gloss_lines))
 
     abbreviations = extract_abbreviations_from_gloss_lines(gloss_lines)
     if not abbreviations:
         st.warning("略号が見つかりませんでした。テキスト形式を確認してください。")
         st.stop()
 
-    df = build_glossary_table(abbreviations, DEFAULT_GLOSSARY)
+    df = build_glossary_table(abbreviations, DEFAULT_GLOSSARY, enable_decomp=enable_decomp)
 
     st.subheader("✅ 略号一覧（Meaningは編集可能）")
     edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
 
-    # CSVダウンロード
     csv = edited_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="⬇️ CSVとしてダウンロード",
