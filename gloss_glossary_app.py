@@ -188,28 +188,36 @@ def extract_abbreviations_from_gloss_lines(gloss_lines: list[str], enable_decomp
     for line in gloss_lines:
         tokens = re.split(r"\s+", line)
         for token in tokens:
+            # --- 1) '=' で分割（右側は必ず独立チェック）
             eq_parts = token.split("=")
-            for part_eq in eq_parts:
+
+            for i, part_eq in enumerate(eq_parts):
                 part_eq = part_eq.strip(".,;:()[]{}\"'")
 
-                # whole segment itself (e.g., "3SG")
-                if ABBR_PATTERN.match(part_eq):
+                # (A) '=' の右側 or 単独語を略号候補としてチェック
+                if (
+                    ABBR_PATTERN.match(part_eq) or
+                    re.fullmatch(r"[0-9]+", part_eq) or
+                    NUM_ALPHA_PATTERN.match(part_eq)
+                ):
                     abbreviations.append(part_eq)
                     if enable_decomp:
                         _add_decomposed_units(part_eq, abbreviations)
 
-                # hyphen suffixes (e.g., lie-PROG -> PROG)
+                # (B) '-' による接尾辞（lie-PROG → PROG）
                 parts_hy = part_eq.split("-")
                 for suf in parts_hy[1:]:
                     suf = suf.strip(".,;:()[]{}\"'")
-                    if not ABBR_PATTERN.match(suf):
-                        continue
-                    abbreviations.append(suf)
-                    if enable_decomp:
-                        _add_decomposed_units(suf, abbreviations)
+                    if (
+                        ABBR_PATTERN.match(suf) or
+                        re.fullmatch(r"[0-9]+", suf) or
+                        NUM_ALPHA_PATTERN.match(suf)
+                    ):
+                        abbreviations.append(suf)
+                        if enable_decomp:
+                            _add_decomposed_units(suf, abbreviations)
 
     return abbreviations
-
 
 # =========================
 # 5) Table builder (uses merged glossary + optional category overrides)
@@ -333,3 +341,4 @@ if run_button:
         file_name="abbreviation_glossary.csv",
         mime="text/csv"
     )
+
