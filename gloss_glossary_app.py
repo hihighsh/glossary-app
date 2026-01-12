@@ -114,12 +114,27 @@ def load_glossary_csv(uploaded_file) -> tuple[dict, dict]:
     """
     Returns:
       (abbr_to_meaning, abbr_to_category)
-    Accepts CSVs with at least Abbreviation, Meaning.
-    Category is optional.
+    Accepts CSVs with at least Abbreviation, Meaning. Category optional.
+    Tries utf-8 first, then cp932 (Windows Japanese) as fallback.
     """
-    df = pd.read_csv(uploaded_file)
-    cols = {c.lower(): c for c in df.columns}
+    # Streamlit UploadedFile is a file-like object; read bytes once
+    data = uploaded_file.getvalue()
 
+    # Try encodings
+    last_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp932", "shift_jis"):
+        try:
+            from io import BytesIO
+            df = pd.read_csv(BytesIO(data), encoding=enc)
+            break
+        except Exception as e:
+            last_err = e
+            df = None
+    if df is None:
+        raise ValueError(f"CSVの文字コードを読み取れませんでした（utf-8/utf-8-sig/cp932/shift_jis を試行）。詳細: {last_err}")
+
+    # Column mapping (case-insensitive)
+    cols = {c.lower().strip(): c for c in df.columns}
     if "abbreviation" not in cols:
         raise ValueError("CSVに 'Abbreviation' 列が見つかりません。")
     if "meaning" not in cols:
@@ -134,11 +149,13 @@ def load_glossary_csv(uploaded_file) -> tuple[dict, dict]:
 
     for _, row in df.iterrows():
         abbr = str(row.get(abbr_col, "")).strip()
-        if not abbr:
+        if not abbr or abbr.lower() == "nan":
             continue
+
         meaning = str(row.get(meaning_col, "")).strip()
         if meaning and meaning.lower() != "nan":
             abbr_to_meaning[abbr] = meaning
+
         if cat_col:
             cat = str(row.get(cat_col, "")).strip()
             if cat and cat.lower() != "nan":
@@ -341,4 +358,5 @@ if run_button:
         file_name="abbreviation_glossary.csv",
         mime="text/csv"
     )
+
 
